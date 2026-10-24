@@ -18,7 +18,7 @@ Pins update automatically when a new position packet is received from the mesh.
 
 ### Overlapping nodes at the same spot
 
-When several nodes report the *same* (or nearly the same) location — for example radios sitting on one desk, or nodes broadcasting a reduced-precision position — their pins stack on top of each other and can't be pulled apart by zooming. Tapping the stack (or the numbered count badge, when node clustering is on) opens a **Select a Node** list of every node at that spot. Pick one to open its detail view. This works whether or not clustering is enabled, so an occluded node is always reachable.
+When several nodes report the *same* (or nearly the same) location — for example radios sitting on one desk, or nodes broadcasting a reduced-precision position — their pins stack on top of each other and can't be pulled apart by zooming. When nodes share exactly the same position, their pins fan out a few points from behind the top pin so you can see there is more than one; the top pin stays on the true position, and the fan is the same size at every zoom. When more than four nodes share the spot, the top pin also shows how many there are. Tapping the stack (or the numbered count badge, when node clustering is on) opens a **Select an Item** list of every node (and waypoint) at that spot. Pick one to open its detail view. This works whether or not clustering is enabled, so an occluded node is always reachable.
 
 ## Filtering Nodes on the Map
 

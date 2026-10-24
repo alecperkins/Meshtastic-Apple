@@ -258,6 +258,9 @@ struct ClusterMapView<Item: Identifiable, Pin: View, Cluster: View>: UIViewRepre
 	/// Set while the caller is animating the camera itself (e.g. a flyover) so the per-frame region
 	/// changes don't re-render `body` (which can spiral on Mac Catalyst with many annotations).
 	let suppressRegionUpdates: Bool
+	/// Optional screen-point nudge and draw order for an item's pin, e.g. to fan out pins that share a
+	/// position. The offset moves only the drawn pin, never its coordinate, so it is the same at every zoom.
+	let pinPlacement: ((Item) -> ClusterMapPinPlacement)?
 
 	@Environment(\.colorScheme) private var colorScheme
 
@@ -279,6 +282,7 @@ struct ClusterMapView<Item: Identifiable, Pin: View, Cluster: View>: UIViewRepre
 		onMapLongPress: ((CLLocationCoordinate2D) -> Void)? = nil,
 		onMapCreated: ((MKMapView) -> Void)? = nil,
 		suppressRegionUpdates: Bool = false,
+		pinPlacement: ((Item) -> ClusterMapPinPlacement)? = nil,
 		@ViewBuilder content pinContent: @escaping (Item) -> Pin,
 		@ViewBuilder clusterContent: @escaping (Int) -> Cluster
 	) {
@@ -297,6 +301,7 @@ struct ClusterMapView<Item: Identifiable, Pin: View, Cluster: View>: UIViewRepre
 		self.onMapLongPress = onMapLongPress
 		self.onMapCreated = onMapCreated
 		self.suppressRegionUpdates = suppressRegionUpdates
+		self.pinPlacement = pinPlacement
 		self.pinContent = pinContent
 		self.clusterContent = clusterContent
 	}
@@ -415,6 +420,7 @@ struct ClusterMapView<Item: Identifiable, Pin: View, Cluster: View>: UIViewRepre
 	/// Re-capture the SwiftUI builders + camera binding onto the (persistent) coordinator.
 	private func refreshClosures(on coordinator: Coordinator) {
 		coordinator.pinContent = { AnyView(pinContent($0)) }
+		coordinator.pinPlacement = pinPlacement
 		coordinator.clusterContent = { AnyView(clusterContent($0)) }
 		coordinator.regionBinding = region
 		coordinator.onSelect = onSelect
@@ -430,6 +436,8 @@ struct ClusterMapView<Item: Identifiable, Pin: View, Cluster: View>: UIViewRepre
 
 		/// Builds the hosted SwiftUI pin for an item. Reset each render so captured state is fresh.
 		var pinContent: (Item) -> AnyView = { _ in AnyView(EmptyView()) }
+		/// Screen-point nudge and draw order for an item's pin (set each render).
+		var pinPlacement: ((Item) -> ClusterMapPinPlacement)?
 		/// Builds the hosted SwiftUI cluster badge for a member count.
 		var clusterContent: (Int) -> AnyView = { _ in AnyView(EmptyView()) }
 		/// The camera binding, set by the representable each render so the delegate can write back.
@@ -775,6 +783,7 @@ struct ClusterMapView<Item: Identifiable, Pin: View, Cluster: View>: UIViewRepre
 						// Refresh a currently-visible view so it reflects the new item snapshot
 						// (e.g. an online/offline change).
 						view.configure(content: pinContent(item))
+						place(view, for: item)
 					}
 				} else {
 					let annotation = ItemAnnotation(item: item, coordinate: coord,
@@ -836,6 +845,7 @@ struct ClusterMapView<Item: Identifiable, Pin: View, Cluster: View>: UIViewRepre
 				// the VIEW too — MapKit reads it from the annotation view when forming clusters.
 				view?.clusteringIdentifier = item.clusteringIdentifier
 				view?.configure(content: pinContent(item.item))
+				if let view { place(view, for: item.item) }
 				return view
 			}
 
@@ -988,6 +998,14 @@ struct ClusterMapView<Item: Identifiable, Pin: View, Cluster: View>: UIViewRepre
 			regionBinding.wrappedValue = newRegion
 		}
 
+		/// Apply the caller's screen-point nudge and draw order to a pin view. A pin without a placement
+		/// goes back to the default, which matters because views are reused across items.
+		private func place(_ view: HostingAnnotationView, for item: Item) {
+			let placement = pinPlacement?(item) ?? ClusterMapPinPlacement()
+			view.pinOffset = placement.offset
+			view.zPriority = MKAnnotationViewZPriority(rawValue: MKAnnotationViewZPriority.defaultUnselected.rawValue + placement.zRank)
+		}
+
 		// MARK: Helpers
 
 		static func coordinatesEqual(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> Bool {
@@ -1028,6 +1046,7 @@ extension ClusterMapView where Cluster == ClusterBadge {
 		onMapLongPress: ((CLLocationCoordinate2D) -> Void)? = nil,
 		onMapCreated: ((MKMapView) -> Void)? = nil,
 		suppressRegionUpdates: Bool = false,
+		pinPlacement: ((Item) -> ClusterMapPinPlacement)? = nil,
 		@ViewBuilder content pinContent: @escaping (Item) -> Pin
 	) {
 		self.init(items: items,
@@ -1045,9 +1064,18 @@ extension ClusterMapView where Cluster == ClusterBadge {
 				onMapLongPress: onMapLongPress,
 				onMapCreated: onMapCreated,
 				suppressRegionUpdates: suppressRegionUpdates,
+				pinPlacement: pinPlacement,
 				  content: pinContent,
 				  clusterContent: { ClusterBadge(count: $0) })
 	}
+}
+
+// MARK: - Pin placement
+
+/// A pin's nudge away from its coordinate, in screen points, and how far above its neighbors it draws.
+struct ClusterMapPinPlacement {
+	var offset: CGPoint = .zero
+	var zRank: Float = 0
 }
 
 // MARK: - Backing MKAnnotation that carries the item by identity
@@ -1095,6 +1123,11 @@ extension ItemAnnotation: AnyClusteredAnnotation {
 private class HostingAnnotationViewBase: MKAnnotationView {
 	/// The persistent `UIView & UIContentView` made from a `UIHostingConfiguration`.
 	private var hostContentView: (UIView & UIContentView)?
+	/// Screen-point nudge of the pin away from its coordinate. Kept here because `configure` re-sizes
+	/// the view and has to re-apply it.
+	var pinOffset: CGPoint = .zero {
+		didSet { centerOffset = pinOffset }
+	}
 
 	override init(annotation: MKAnnotation?, reuseIdentifier: String?) {
 		super.init(annotation: annotation, reuseIdentifier: reuseIdentifier)
@@ -1128,7 +1161,7 @@ private class HostingAnnotationViewBase: MKAnnotationView {
 			?? CGSize(width: 40, height: 40)
 		frame = CGRect(origin: frame.origin, size: CGSize(width: max(target.width, 1),
 														  height: max(target.height, 1)))
-		centerOffset = .zero // MapKit places the view's CENTER on the coordinate — what we want.
+		centerOffset = pinOffset // MapKit places the view's CENTER on the coordinate (plus any nudge).
 	}
 }
 

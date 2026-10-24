@@ -70,8 +70,6 @@ struct MeshMapMK: View {
 	/// Vector overlays (accuracy circles + convex hull) — rebuilt on data change, stable between
 	/// renders so ClusterMapView's overlay diff is a no-op when nothing changed.
 	@State private var mapOverlays: [ClusterMapOverlay] = []
-	/// Display-coordinate overrides for nodes that sit on (nearly) the same point, fanned out into
-	/// a small ring so a stacked cluster always breaks into individual, tappable node circles.
 	/// Guards the one-time initial camera framing (GPS-centered, zoomed out, ~100 miles max).
 	@State private var didInitialFrame = false
 	/// One-shot camera move fed to the map. Set ONCE by the initial framing; after that the user
@@ -374,17 +372,25 @@ struct MeshMapMK: View {
 				decorations: combinedMapDecorations(),
 				onMapLongPress: { coordinate in beginNewWaypoint(at: coordinate) },
 				onMapCreated: { flyover.mapView = $0 },
-				suppressRegionUpdates: flyover.isFlying
+				suppressRegionUpdates: flyover.isFlying,
+				pinPlacement: { item in stackPlacement(for: item) }
 			) { item in
 				switch item {
 				case let .node(snapshot):
-					MeshMapMKNodePin(nodeNum: snapshot.nodeNum, shortName: snapshot.shortName, isOnline: snapshot.isOnline, calculatedDelay: snapshot.calculatedDelay, dense: isDense)
+					MeshMapMKNodePin(nodeNum: snapshot.nodeNum, shortName: snapshot.shortName, isOnline: snapshot.isOnline, calculatedDelay: snapshot.calculatedDelay, dense: isDense, stackCount: snapshot.stackSlot?.shownCount ?? 0)
 						.equatable()
 				case let .waypoint(waypoint):
 					// Distinct waypoint glyph when not clustered (matches the map legend's orange circle).
 					CircleText(text: waypoint.icon, color: .orange, circleSize: 36)
 				}
 			}
+	}
+
+	/// Fans a stacked node's pin out from behind the top of its stack (see `MapStackLayout`). Dense dot
+	/// mode skips it: the dots are already too small to stack visibly.
+	private func stackPlacement(for item: MeshMapItem) -> ClusterMapPinPlacement {
+		guard !isDense, case let .node(snapshot) = item, let slot = snapshot.stackSlot else { return ClusterMapPinPlacement() }
+		return ClusterMapPinPlacement(offset: MapStackLayout.offset(for: slot), zRank: slot.drawRank)
 	}
 
 	/// Node position snapshots + waypoint snapshots merged into one clustering item list, so a waypoint
@@ -1977,7 +1983,7 @@ struct MeshMapMK: View {
 	}
 
 	private func makePositionSnapshots(from positions: [PositionEntity]) -> [MeshMapPositionSnapshot] {
-		positions.compactMap { position -> MeshMapPositionSnapshot? in
+		let snapshots = positions.compactMap { position -> MeshMapPositionSnapshot? in
 			let coordinate: CLLocationCoordinate2D = if position.isPreciseLocation {
 				position.nodeCoordinate ?? LocationsHandler.DefaultLocation
 			} else {
@@ -2005,6 +2011,9 @@ struct MeshMapMK: View {
 				calculatedDelay: Double(nodeNum.magnitude % 100) / 100.0 * 0.5
 			)
 		}
+		// Nodes rounded onto the same point by position precision fan out a few points instead of
+		// stacking invisibly under one pin.
+		return MapStackLayout.assigningSlots(to: snapshots, activeNodeNum: accessoryManager.activeDeviceNum)
 	}
 
 	private func densityLimitedPositions(_ positions: [PositionEntity]) -> [PositionEntity] {
@@ -2125,6 +2134,8 @@ private struct MeshMapMKNodePin: View, Equatable {
 	let isOnline: Bool
 	let calculatedDelay: Double
 	let dense: Bool
+	/// Total nodes at this spot, shown on the top pin of a stack too big to fan out in full; 0 for none.
+	var stackCount: Int = 0
 
 	var body: some View {
 		if dense {
@@ -2141,7 +2152,32 @@ private struct MeshMapMKNodePin: View, Equatable {
 				calculatedDelay: calculatedDelay,
 				showsPulse: true
 			)
+			.overlay(alignment: .topTrailing) {
+				if stackCount > 0 {
+					MapStackCountBadge(count: stackCount)
+						.offset(x: 6, y: -6)
+				}
+			}
 		}
+	}
+}
+
+/// How many nodes share a stacked pin's spot, on the top pin's corner. A small version of the
+/// cluster badge, so the two read as the same kind of count.
+private struct MapStackCountBadge: View {
+	let count: Int
+
+	var body: some View {
+		Text("\(count)")
+			.font(.system(size: 11, weight: .bold, design: .rounded))
+			.foregroundStyle(.white)
+			.padding(.horizontal, 4)
+			.frame(minWidth: 20, minHeight: 20)
+			.background(
+				Capsule().fill(Color.accentFill)
+					.overlay(Capsule().stroke(.white.opacity(0.9), lineWidth: 1.5))
+			)
+			.shadow(color: .black.opacity(0.25), radius: 1, y: 1)
 	}
 }
 

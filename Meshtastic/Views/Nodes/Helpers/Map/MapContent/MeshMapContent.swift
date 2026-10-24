@@ -9,6 +9,7 @@
 //  renders these snapshots itself. Only the lightweight, render-agnostic types live here now.
 //
 
+import CoreGraphics
 import CoreLocation
 
 /// Single source of truth for the map's coincident-node threshold, shared by both tap paths
@@ -19,6 +20,89 @@ enum MapColocation {
 	/// stack that zooming can't separate — below this, the map offers the "Select a Node" picker
 	/// instead of a max-zoom lurch (clustering on) or selecting only the topmost pin (clustering off).
 	static let spreadMeters = 5.0
+}
+
+/// Where a node's pin sits among other nodes reporting exactly the same position.
+struct MapStackSlot: Equatable {
+	/// 0 is drawn on top, on the true position. 1 up to `MapStackLayout.maxVisible` peek out from
+	/// behind it; the rest sit underneath it.
+	let index: Int
+	/// How many nodes share the position.
+	let count: Int
+
+	/// Only the top pin of a stack too big to show in full carries the count.
+	var showsCount: Bool { index == 0 && count > MapStackLayout.maxVisible }
+
+	/// The count this pin shows, or nil when it shows none.
+	var shownCount: Int? { showsCount ? count : nil }
+
+	/// Added to the pin's z-priority so the top of a stack draws above the rest of it.
+	var drawRank: Float { Float(MapStackLayout.maxVisible - min(index, MapStackLayout.maxVisible)) }
+}
+
+/// Fans out pins that share a position so a stack doesn't look like a single node.
+///
+/// Firmware position precision rounds every node in an area onto the same point, so a busy site is
+/// mostly nodes with identical coordinates. The top pin stays on the true position, the next few are
+/// drawn a few screen points out from behind it, and the rest hide underneath. The offset is in
+/// screen points, not meters, so no pin moves on the ground and the stack looks the same at every
+/// zoom.
+enum MapStackLayout {
+	/// How many pins of one stack are visible at once. A bigger stack also shows its count.
+	static let maxVisible = 4
+
+	/// Where slots 1 to 3 peek out from, in points (x right, y down). Slot 0 sits on the true position.
+	private static let peekOffsets: [CGPoint] = [CGPoint(x: -7, y: -6), CGPoint(x: 7, y: -6), CGPoint(x: 0, y: 7)]
+
+	private struct PositionKey: Hashable {
+		let latitudeI: Int32
+		let longitudeI: Int32
+	}
+
+	/// `snapshots` with `stackSlot` set on every node that shares its exact integer position with
+	/// another, in the same order. The connected node goes on top, then online nodes, then lower node
+	/// numbers, so the order doesn't shuffle between refreshes.
+	///
+	/// A node can appear twice (e.g. positions whose node is nil, all num 0), so a stack counts node
+	/// numbers, not snapshots, and duplicates share a slot. Stacked nodes are drawn at the shared
+	/// position rather than a fuzzed one, so the fan is the only thing separating them.
+	static func assigningSlots(to snapshots: [MeshMapPositionSnapshot], activeNodeNum: Int64?) -> [MeshMapPositionSnapshot] {
+		var stacks: [PositionKey: [Int]] = [:]
+		for (offset, snapshot) in snapshots.enumerated() {
+			stacks[PositionKey(latitudeI: snapshot.latitudeI, longitudeI: snapshot.longitudeI), default: []].append(offset)
+		}
+		var result = snapshots
+		for (key, members) in stacks {
+			var seenNodeNums = Set<Int64>()
+			let ordered = members
+				.filter { seenNodeNums.insert(snapshots[$0].nodeNum).inserted }
+				.sorted { lhs, rhs in precedes(snapshots[lhs], snapshots[rhs], activeNodeNum: activeNodeNum) }
+			guard ordered.count > 1 else { continue }
+			var slotByNodeNum: [Int64: MapStackSlot] = [:]
+			for (index, offset) in ordered.enumerated() {
+				slotByNodeNum[snapshots[offset].nodeNum] = MapStackSlot(index: index, count: ordered.count)
+			}
+			let shared = CLLocationCoordinate2D(latitude: Double(key.latitudeI) / 1e7, longitude: Double(key.longitudeI) / 1e7)
+			for offset in members {
+				result[offset].stackSlot = slotByNodeNum[snapshots[offset].nodeNum]
+				result[offset].coordinate = shared
+			}
+		}
+		return result
+	}
+
+	/// How far a slot's pin is drawn from the true position, in screen points.
+	static func offset(for slot: MapStackSlot?) -> CGPoint {
+		guard let slot, slot.index >= 1, slot.index <= peekOffsets.count else { return .zero }
+		return peekOffsets[slot.index - 1]
+	}
+
+	private static func precedes(_ lhs: MeshMapPositionSnapshot, _ rhs: MeshMapPositionSnapshot, activeNodeNum: Int64?) -> Bool {
+		let lhsActive = lhs.nodeNum == activeNodeNum, rhsActive = rhs.nodeNum == activeNodeNum
+		if lhsActive != rhsActive { return lhsActive }
+		if lhs.isOnline != rhs.isOnline { return lhs.isOnline }
+		return lhs.nodeNum < rhs.nodeNum
+	}
 }
 
 /// Dedup key for reduced-precision accuracy circles (one circle per location + precision).
@@ -45,7 +129,8 @@ struct ColocatedMapStack: Identifiable {
 /// reevaluations do not repeatedly fault SwiftData relationships.
 struct MeshMapPositionSnapshot: Identifiable {
 	let id: Int64
-	let coordinate: CLLocationCoordinate2D
+	/// Where the pin is drawn. `MapStackLayout` moves a stacked node back onto the shared position.
+	var coordinate: CLLocationCoordinate2D
 	let latitudeI: Int32
 	let longitudeI: Int32
 	let precisionBits: Int32
@@ -55,6 +140,8 @@ struct MeshMapPositionSnapshot: Identifiable {
 	let isOnline: Bool
 	let viaMqtt: Bool
 	let calculatedDelay: Double
+	/// Set when other nodes report exactly the same position (see `MapStackLayout`).
+	var stackSlot: MapStackSlot?
 }
 
 /// Lightweight snapshot of a waypoint, extracted outside the render pass (mirrors
